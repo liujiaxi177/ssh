@@ -153,7 +153,16 @@ class TranscriptFidelityTests(unittest.TestCase):
             observer_mode="transcript",
         )
 
-    def test_transcript_preserves_crlf(self) -> None:
+    def test_transcript_matches_what_the_session_returned(self) -> None:
+        """The transcript must be byte-identical to the session's own output.
+
+        Asserting on a literal CRLF count would be platform-specific: a POSIX pty
+        rewrites LF to CRLF on its own (ONLCR), so a child that writes CRLF
+        legitimately comes back as CRCRLF there.  Comparing the on-disk bytes
+        with the value the tool hands back catches what actually matters -- that
+        writing the transcript does not rewrite line endings a second time
+        (``newline=None`` on Windows would turn CRLF into CRCRLF).
+        """
         with tempfile.TemporaryDirectory() as tmp:
             manager = SessionManager(state_dir=Path(tmp))
             try:
@@ -164,23 +173,29 @@ class TranscriptFidelityTests(unittest.TestCase):
                     # child's stdout happens to be a console or a pipe.
                     "import os; os.write(1, b'alpha\\r\\nbeta\\r\\n')",
                 )
-                session.read(wait_seconds=3.0, max_output_chars=65536)
-                deadline = 5.0
                 import time
 
+                deadline = 10.0
                 waited = 0.0
                 while session.process.poll() is None and waited < deadline:
                     time.sleep(0.05)
                     waited += 0.05
-                session.read(wait_seconds=1.0, max_output_chars=65536)
+                output = ""
+                # Drain until the stream settles; the reader thread appends the
+                # final chunk right after the child exits.
+                for _ in range(5):
+                    chunk = session.read(wait_seconds=0.4, max_output_chars=65536)["output"]
+                    if not chunk and output:
+                        break
+                    output += chunk
             finally:
                 manager.close()
             raw = (Path(tmp) / session.session_id / "transcript.log").read_bytes()
 
-        self.assertIn(b"alpha\r\n", raw)
-        self.assertIn(b"beta\r\n", raw)
-        # No CRLF was rewritten into CRCRLF or a bare LF.
-        self.assertNotIn(b"\r\r\n", raw)
+        self.assertIn("alpha", output)
+        self.assertIn("beta", output)
+        self.assertEqual(raw.decode("utf-8"), output)
+        # Whatever the terminal produced, no line feed was left on its own.
         self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
 
     def test_session_write_and_read_roundtrip(self) -> None:
