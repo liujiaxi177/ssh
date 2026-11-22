@@ -3,11 +3,10 @@ from __future__ import annotations
 import codecs
 import errno
 import os
+import queue
 import re
-import select
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -18,6 +17,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from .platform_support import (
+    IS_WINDOWS,
+    LocalPty,
+    PtyBackendError,
+    child_environment,
+    reap,
+    spawn_kwargs,
+    spawn_local_pty,
+    terminate_process,
+    wait_for_exit,
+)
 
 DEFAULT_MAX_OUTPUT_CHARS = 65_536
 # Hard cap on in-memory unread-output buffer per session.  The transcript on
@@ -31,6 +42,10 @@ DEFAULT_VIEW_MAX_BYTES = 20_480  # 20 KiB, matches the local file-viewing tool's
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_STRICT_HOST_KEY_CHECKING = {"yes", "no", "ask", "accept-new", "off"}
 _ALLOWED_OBSERVER_MODES = {"transcript", "tmux"}
+# The tmux observer is only useful from a terminal that can attach to it.  On
+# Windows there is no tmux in the box, and the client that started the server
+# has no console to attach from, so the transcript is the sane default there.
+DEFAULT_OBSERVER_MODE = "transcript" if IS_WINDOWS else "tmux"
 _ALLOWED_GREP_OUTPUT_MODES = {"content", "files_with_matches", "count"}
 _EXIT_SIGNAL_NAMES = {9: "killed", 13: "broken-pipe", 15: "terminated"}
 
@@ -327,7 +342,7 @@ def _observer_mode_argument(
     arguments: Mapping[str, Any],
     name: str = "observer_mode",
     *,
-    default: str = "tmux",
+    default: str = DEFAULT_OBSERVER_MODE,
 ) -> str:
     value = arguments.get(name)
     if value is None:
@@ -394,34 +409,27 @@ def _split_return_code(return_code: int | None) -> tuple[int | None, int | None]
     return None, -return_code
 
 
-def _wait_for_exit(process: subprocess.Popen[Any], timeout_seconds: float) -> bool:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            return True
-        time.sleep(0.05)
-    return process.poll() is not None
-
-
-def _signal_process_group(process: subprocess.Popen[Any], sig: signal.Signals) -> None:
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        return
+def _wait_for_exit(process: Any, timeout_seconds: float) -> bool:
+    return wait_for_exit(process, timeout_seconds)
 
 
 def _terminate_process_group(
-    process: subprocess.Popen[Any],
+    process: Any,
     *,
-    first_signal: signal.Signals = signal.SIGTERM,
     grace_period: float = 0.5,
 ) -> bool:
+    """Terminate *process* and its children; returns True if force was needed.
+
+    The signal plumbing differs per platform (process groups and SIGKILL on
+    POSIX, explicit tree termination on Windows), so it lives in
+    ``platform_support``.
+    """
     if process.poll() is not None:
         return False
-    _signal_process_group(process, first_signal)
+    terminate_process(process, force=False)
     if _wait_for_exit(process, grace_period):
         return False
-    _signal_process_group(process, signal.SIGKILL)
+    terminate_process(process, force=True)
     _wait_for_exit(process, 1.0)
     return True
 
@@ -458,6 +466,11 @@ def _default_state_dir() -> Path:
     configured = os.environ.get("SSH_MCP_STATE_DIR")
     if configured:
         return Path(configured).expanduser()
+    if IS_WINDOWS:
+        # Transcripts may hold secrets; keep them out of the roaming profile.
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / "ssh-mcp"
     xdg_state_home = os.environ.get("XDG_STATE_HOME")
     if xdg_state_home:
         return Path(xdg_state_home).expanduser() / "ssh-mcp"
@@ -484,27 +497,6 @@ def _sanitize_tmux_session_name(
     return f"ssh-mcp-{session_id[:8]}"
 
 
-def _read_all_available(master_fd: int, decoder: codecs.IncrementalDecoder) -> str:
-    chunks: list[str] = []
-    while True:
-        try:
-            ready, _, _ = select.select([master_fd], [], [], 0)
-        except OSError:
-            break
-        if not ready:
-            break
-        try:
-            data = os.read(master_fd, 4096)
-        except OSError as exc:
-            if exc.errno in {errno.EIO, errno.EBADF}:
-                break
-            raise
-        if not data:
-            break
-        chunks.append(decoder.decode(data))
-    return "".join(chunks)
-
-
 def _run_without_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
     start = time.monotonic()
     process = subprocess.Popen(
@@ -515,7 +507,8 @@ def _run_without_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any
         text=True,
         encoding="utf-8",
         errors="replace",
-        start_new_session=True,
+        env=child_environment(),
+        **spawn_kwargs(),
     )
     timed_out = False
     forced_kill = False
@@ -558,7 +551,8 @@ def _run_without_pty_binary_safe(
         stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        start_new_session=True,
+        env=child_environment(),
+        **spawn_kwargs(),
     )
     timed_out = False
     forced_kill = False
@@ -581,61 +575,69 @@ def _run_without_pty_binary_safe(
 
 
 def _run_with_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
+    """Run *argv* attached to a local terminal and collect its output.
+
+    The terminal comes from ``platform_support.spawn_local_pty`` (a real PTY on
+    POSIX, ConPTY or a pipe stand-in on Windows).  Reading happens on a helper
+    thread because every backend's read blocks; the queue keeps the deadline
+    handling in one place instead of duplicating it per backend.
+    """
     start = time.monotonic()
-    master_fd, slave_fd = os.openpty()
+    try:
+        pty = spawn_local_pty(argv)
+    except PtyBackendError as exc:
+        raise ValidationError(str(exc)) from exc
+    process = pty.process
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     output_chunks: list[str] = []
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except Exception:
-        os.close(master_fd)
-        os.close(slave_fd)
-        raise
-    os.close(slave_fd)
+    stream: queue.Queue[bytes | None] = queue.Queue()
+
+    def pump() -> None:
+        try:
+            while True:
+                try:
+                    data = pty.read(4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                stream.put(data)
+        finally:
+            stream.put(None)
+
+    reader = threading.Thread(target=pump, name="ssh-exec-pty-reader", daemon=True)
+    reader.start()
     timed_out = False
-    forced_kill = False
     deadline = time.monotonic() + timeout if timeout is not None else None
+    exited_at: float | None = None
     try:
         while True:
+            try:
+                chunk = stream.get(timeout=0.1)
+            except queue.Empty:
+                chunk = b""
+            if chunk is None:
+                break
+            if chunk:
+                output_chunks.append(decoder.decode(chunk))
+                continue
+            if process.poll() is not None:
+                # The child is gone; give the reader a moment to flush whatever
+                # is still in flight before declaring the stream finished.
+                exited_at = exited_at or time.monotonic()
+                if time.monotonic() - exited_at > 5.0:
+                    break
             if deadline is not None and process.poll() is None and time.monotonic() >= deadline:
                 timed_out = True
-                forced_kill = _terminate_process_group(process)
-            wait_timeout = 0.1
-            if deadline is not None and process.poll() is None:
-                wait_timeout = max(0.0, min(0.1, deadline - time.monotonic()))
-            try:
-                ready, _, _ = select.select([master_fd], [], [], wait_timeout)
-            except OSError:
-                ready = []
-            if ready:
-                try:
-                    data = os.read(master_fd, 4096)
-                except OSError as exc:
-                    if exc.errno in {errno.EIO, errno.EBADF}:
-                        data = b""
-                    else:
-                        raise
-                if data:
-                    output_chunks.append(decoder.decode(data))
-            if process.poll() is not None:
-                output_chunks.append(_read_all_available(master_fd, decoder))
-                break
+                _terminate_process_group(process)
+                deadline = None
         output_chunks.append(decoder.decode(b"", final=True))
     finally:
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
+        pty.close()
+        reader.join(timeout=1.0)
     duration_ms = int((time.monotonic() - start) * 1000)
     output = "".join(part for part in output_chunks if part)
-    exit_code, term_signal = _split_return_code(process.returncode)
+    exit_code, term_signal = _split_return_code(reap(process))
     return {
         "exit_code": exit_code,
         "signal": term_signal,
@@ -1198,7 +1200,8 @@ class ForwardManager:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                start_new_session=True,
+                env=child_environment(),
+                **spawn_kwargs(),
             )
             entry = ForwardEntry(
                 forward_id=forward_id,
@@ -1290,8 +1293,7 @@ class SshSession:
         target: str,
         argv: list[str],
         remote_command: str | None,
-        process: subprocess.Popen[Any],
-        master_fd: int,
+        pty: LocalPty,
         transcript_path: Path,
         observer_mode: str,
         tmux_binary: str | None,
@@ -1303,9 +1305,9 @@ class SshSession:
         self.argv = list(argv)
         self.ssh_command = shlex.join(argv)
         self.remote_command = remote_command
-        self.process = process
-        self._master_fd = master_fd
-        self._master_closed = False
+        self.pty = pty
+        self.process = pty.process
+        self._pty_closed = False
         self._auto_close = auto_close
         self._condition = threading.Condition()
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -1321,10 +1323,14 @@ class SshSession:
         self._transcript_lock = threading.Lock()
         # Restrict transcript permissions — transcripts may contain secrets
         # (sudo passwords, API keys echoed during sessions).
-        transcript_fd = os.open(
-            str(self._transcript_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
-        )
-        self._transcript_file = os.fdopen(transcript_fd, "a", encoding="utf-8")
+        # O_BINARY + newline="" keep the byte-for-byte fidelity of what the
+        # terminal produced: without them Windows rewrites every "\n" to
+        # "\r\n", turning the pty's own "\r\n" into "\r\r\n" in the transcript.
+        transcript_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_BINARY"):
+            transcript_flags |= os.O_BINARY
+        transcript_fd = os.open(str(self._transcript_path), transcript_flags, 0o600)
+        self._transcript_file = os.fdopen(transcript_fd, "a", encoding="utf-8", newline="")
         self._configured_tmux_binary = tmux_binary
         self._observer_lock = threading.Lock()
         self._tmux_launch_lock = threading.Lock()
@@ -1358,6 +1364,8 @@ class SshSession:
         if not text:
             return
         with self._transcript_lock:
+            if self._transcript_file.closed:
+                return
             self._transcript_file.write(text)
             self._transcript_file.flush()
 
@@ -1397,6 +1405,8 @@ class SshSession:
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=5,
+                env=child_environment(),
+                **spawn_kwargs(),
             )
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or "").strip()
@@ -1477,6 +1487,8 @@ class SshSession:
                     stderr=subprocess.PIPE,
                     text=True,
                     timeout=5,
+                    env=child_environment(),
+                    **spawn_kwargs(),
                 )
             except OSError as exc:
                 with self._observer_lock:
@@ -1507,21 +1519,18 @@ class SshSession:
                     return
                 self._reset_observer_to_transcript_locked()
 
-    def _close_master_fd(self) -> None:
+    def _close_pty(self) -> None:
         with self._condition:
-            if self._master_closed:
+            if self._pty_closed:
                 return
-            try:
-                os.close(self._master_fd)
-            except OSError:
-                pass
-            self._master_closed = True
+            self._pty_closed = True
+        self.pty.close()
 
     def _reader_loop(self) -> None:
         try:
             while True:
                 try:
-                    data = os.read(self._master_fd, 4096)
+                    data = self.pty.read(4096)
                 except OSError as exc:
                     if exc.errno in {errno.EIO, errno.EBADF}:
                         break
@@ -1545,7 +1554,7 @@ class SshSession:
                 self._update_process_status_locked()
                 self._condition.notify_all()
             self._close_transcript()
-            self._close_master_fd()
+            self._close_pty()
             self._stop_tmux_observer()
 
     def _append_unread_locked(self, text: str) -> None:
@@ -1656,32 +1665,29 @@ class SshSession:
         if not isinstance(input_text, str):
             raise ValidationError("'input' must be a string.")
         payload = input_text.encode("utf-8")
-        # Validate session state under the lock, then snapshot the fd so we can
-        # write *outside* the lock.  Holding _condition during os.write() would
-        # deadlock with the reader thread when the PTY kernel buffer is full:
-        # the reader needs the lock to drain output, but draining is what makes
-        # space for the write to complete.
+        # Validate session state under the lock, then write *outside* the lock.
+        # Holding _condition during the write would deadlock with the reader
+        # thread when the terminal buffer is full: the reader needs the lock to
+        # drain output, but draining is what makes space for the write to
+        # complete.
         with self._condition:
             self._update_process_status_locked()
             if self.process.poll() is not None:
                 raise ValidationError(
                     f"Session '{self.session_id}' has already exited with return code {self.process.returncode}."
                 )
-            if self._master_closed:
+            if self._pty_closed:
                 raise ValidationError(f"Session '{self.session_id}' is not writable anymore.")
-            master_fd = self._master_fd
-        bytes_written = 0
         try:
-            buffer = memoryview(payload)
-            while bytes_written < len(buffer):
-                written = os.write(master_fd, buffer[bytes_written:])
-                if written <= 0:
-                    raise OSError(errno.EIO, "short write to PTY")
-                bytes_written += written
+            bytes_written = self.pty.write(payload)
         except OSError as exc:
             with self._condition:
                 self._update_process_status_locked()
-                closed = exc.errno in {errno.EBADF, errno.EIO} or self.process.poll() is not None or self._master_closed
+                closed = (
+                    exc.errno in {errno.EBADF, errno.EIO, errno.EPIPE}
+                    or self.process.poll() is not None
+                    or self._pty_closed
+                )
             if closed:
                 raise ValidationError(
                     f"Session '{self.session_id}' is no longer writable because it has already closed."
@@ -1703,9 +1709,9 @@ class SshSession:
         termination_signal = None
         if was_running:
             termination_signal = "SIGKILL" if force else "SIGTERM"
-            _signal_process_group(self.process, signal.SIGKILL if force else signal.SIGTERM)
+            terminate_process(self.process, force=force)
             if not _wait_for_exit(self.process, wait_seconds):
-                _signal_process_group(self.process, signal.SIGKILL)
+                terminate_process(self.process, force=True)
                 forced_kill = True
                 _wait_for_exit(self.process, 1.0)
             with self._condition:
@@ -1713,6 +1719,13 @@ class SshSession:
                 self._condition.notify_all()
         if self.process.poll() is not None:
             self._reader.join(timeout=0.1)
+            # The child is gone, so nothing else can arrive.  Release the
+            # terminal and the transcript here as well: if the reader thread is
+            # still parked (a Windows ConPTY can take a moment to report EOF),
+            # nobody else would close them, and an open transcript handle keeps
+            # the session directory from ever being removed.
+            self._close_transcript()
+            self._close_pty()
         # Settle the observer (blocking on _reader_loop's own stop attempt if
         # one is already in flight) *before* snapshotting, so the response
         # always reflects the final state instead of a pre-stop snapshot.
@@ -1805,24 +1818,10 @@ class SessionManager:
             session_id = self._allocate_session_id()
             session_dir = self._state_dir / session_id
             transcript_path = session_dir / "transcript.log"
-            master_fd, slave_fd = os.openpty()
             try:
-                process = subprocess.Popen(
-                    argv,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            except Exception:
-                os.close(master_fd)
-                raise
-            finally:
-                try:
-                    os.close(slave_fd)
-                except OSError:
-                    pass
+                pty = spawn_local_pty(argv)
+            except PtyBackendError as exc:
+                raise ValidationError(str(exc)) from exc
             try:
                 session = SshSession(
                     session_id=session_id,
@@ -1830,19 +1829,15 @@ class SessionManager:
                     target=target,
                     argv=argv,
                     remote_command=remote_command,
-                    process=process,
-                    master_fd=master_fd,
+                    pty=pty,
                     transcript_path=transcript_path,
                     observer_mode=observer_mode,
                     tmux_binary=self._tmux_binary,
                     auto_close=auto_close,
                 )
             except Exception:
-                _terminate_process_group(process, grace_period=0.1)
-                try:
-                    os.close(master_fd)
-                except OSError:
-                    pass
+                _terminate_process_group(pty.process, grace_period=0.1)
+                pty.close()
                 raise
             self._sessions[session_id] = session
         session.ensure_observer_mode(observer_mode)

@@ -4,6 +4,23 @@ Give your AI coding agent access to remote machines through your local OpenSSH c
 
 Run ssh-mcp on the machine where your MCP client runs. Your remote hosts only need SSH access and the usual command-line tools; you don't install an MCP server on them.
 
+> **This fork** (`ssh-mcp-win`) targets **Windows 11**: interactive sessions and
+> `tty` commands work through ConPTY instead of `os.openpty()`, and process
+> termination, transcripts, and default paths follow Windows conventions. It is a
+> fork of [slepp/ssh-mcp](https://github.com/slepp/ssh-mcp) (MIT) — all credit for
+> the original design goes upstream; see [Windows 11](#windows-11) for what
+> changed.
+
+```powershell
+uvx --from git+https://github.com/liujiaxi177/ssh ssh-mcp
+```
+
+Once published on PyPI, the shorter form works too:
+
+```powershell
+uvx ssh-mcp-win
+```
+
 ## Why ssh-mcp?
 
 - **Uses your local SSH** — host aliases, `~/.ssh/config`, `ProxyJump`, agent forwarding, and existing credentials all work naturally. No SSH libraries or key management.
@@ -11,15 +28,49 @@ Run ssh-mcp on the machine where your MCP client runs. Your remote hosts only ne
 - **Persistent sessions** — agents can keep a shell open across multiple tool calls, just like a human would. A stable `session_name` lets an agent find the same session after a context reset, while the MCP server keeps running.
 - **Observable** — every session records a transcript and optionally launches a detached tmux viewer so you can watch what the agent is doing in real time.
 - **Permission-gatable** — port forwarding is a separate tool from command execution, so MCP clients can allow SSH access without allowing port forwards.
-- **Pure Python** — no third-party runtime dependencies. Uses Python 3.10+ and your system's OpenSSH tools.
+- **Pure Python** — no third-party runtime dependencies on POSIX; on Windows the only dependency is `pywinpty`, which is what makes a local terminal possible there. Uses Python 3.10+ and your system's OpenSSH tools.
 
 ## Requirements
 
-- Python 3.10+ in a POSIX environment, such as macOS or Linux (interactive sessions and `tty` commands need a local PTY)
+- Python 3.10+ on **Windows 11** (primary target) or a POSIX environment such as macOS or Linux
+- A local terminal for interactive sessions and `tty` commands — POSIX gets this from `os.openpty()`, Windows from ConPTY (see [Windows](#windows-11))
 - `ssh` and `scp` on PATH (or set `SSH_MCP_SSH_BIN` / `SSH_MCP_SCP_BIN`)
 - `rsync` locally and on the remote host — only needed for `ssh_sync`; set `SSH_MCP_RSYNC_BIN` to override the local executable
 - `grep` and `find` on the **remote** host — needed for `ssh_grep` / `ssh_glob` (present on effectively all POSIX systems)
-- `tmux` locally — optional, for live session observation
+- `tmux` locally — optional, for live session observation (POSIX only; Windows uses the transcript)
+
+### Windows 11
+
+Windows has no `os.openpty()`, so interactive tools need ConPTY — a Win32 API with
+no standard-library binding. The server drives it through
+[`pywinpty`](https://github.com/winpty/pywinpty), which is installed automatically on
+Windows:
+
+```powershell
+pip install ssh-mcp-win          # pulls in pywinpty on Windows
+```
+
+What that buys you, compared with plain pipes:
+
+| | ConPTY (default) | Pipe fallback |
+|---|---|---|
+| Remote PTY (`ssh -tt`) | yes | yes |
+| Terminal size forwarded (`stty size`) | yes, 40x120 | no, remote sees `0 0` |
+| `ssh` password / host-key prompts | yes | no (no console to prompt on) |
+| Extra dependency | `pywinpty` | none |
+
+If `pywinpty` cannot be imported, the server falls back to pipes automatically and
+keeps working — interactive programs still see a remote PTY, they just cannot rely
+on a window size. Force a backend with `SSH_MCP_PTY_BACKEND=conpty|pipe|auto`.
+
+Windows notes:
+
+- `ssh_sync` still needs a local `rsync` (stock Windows has none — install one or
+  point `SSH_MCP_RSYNC_BIN` at it). `ssh_scp` needs nothing extra.
+- Transcripts live in `%LOCALAPPDATA%\ssh-mcp` unless `SSH_MCP_STATE_DIR` is set.
+- The default `observer_mode` is `transcript`; tmux observation is a POSIX feature.
+- ConPTY re-renders the console, so output can carry an extra terminal handshake at
+  the start of a session and full-screen programs redraw more than on POSIX.
 
 ## Check your SSH connection
 
@@ -33,21 +84,38 @@ Verify the host fingerprint if SSH asks, and make sure your key or SSH agent is 
 
 ## Installation
 
-### With uv (recommended)
+### With uv (recommended on Windows)
 
 With [uv installed](https://docs.astral.sh/uv/getting-started/installation/), your MCP client can launch ssh-mcp with:
 
 ```bash
-uvx --from slepp-ssh-mcp ssh-mcp
+uvx --from ssh-mcp-win ssh-mcp
 ```
 
-This runs the `ssh-mcp` command from the `slepp-ssh-mcp` package. Running it directly waits for MCP requests on standard input; there is no interactive prompt.
+This runs the `ssh-mcp` command from the `ssh-mcp-win` package (which is this
+fork; the upstream package is `slepp-ssh-mcp`). Running it directly waits for MCP
+requests on standard input; there is no interactive prompt.
 
-To install the command persistently:
+To install the command persistently — startup is faster because nothing is
+resolved on each launch:
 
 ```bash
-uv tool install slepp-ssh-mcp
+uv tool install ssh-mcp-win
 ```
+
+That puts `ssh-mcp` (and an `ssh-mcp-win` alias) on your PATH, usually at
+`%USERPROFILE%\.local\bin\ssh-mcp.exe` on Windows. Point your client's `command`
+at that path and use an empty `args` array.
+
+To track a branch or tag instead of PyPI, install straight from git (the name
+after `--from` must be the distribution name, not the command name):
+
+```bash
+uv tool install --from git+https://github.com/liujiaxi177/ssh ssh-mcp-win
+```
+
+Both `ssh-mcp` and `ssh-mcp-win` are installed as commands; they are the same
+server.
 
 ### With pip
 
@@ -55,10 +123,12 @@ Use a virtual environment:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install slepp-ssh-mcp
+.venv/bin/python -m pip install ssh-mcp-win
 ```
 
-Set your client's `command` to the absolute path to `.venv/bin/ssh-mcp` and use an empty `args` array. This keeps the server available even when the client starts outside your shell.
+On Windows the executables land in `.venv\Scripts\`. Set your client's `command`
+to the absolute path to that `ssh-mcp.exe` and use an empty `args` array. This
+keeps the server available even when the client starts outside your shell.
 
 ## Connect your MCP client
 
@@ -67,7 +137,7 @@ The examples below use `uvx`. If it is not on your client's PATH, use its absolu
 ### Claude Code
 
 ```bash
-claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
+claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from ssh-mcp-win ssh-mcp
 ```
 
 Or commit a `.mcp.json` to share with your team:
@@ -78,7 +148,7 @@ Or commit a `.mcp.json` to share with your team:
     "ssh-mcp": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
+      "args": ["--from", "ssh-mcp-win", "ssh-mcp"]
     }
   }
 }
@@ -87,7 +157,7 @@ Or commit a `.mcp.json` to share with your team:
 ### Codex CLI
 
 ```bash
-codex mcp add ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
+codex mcp add ssh-mcp -- uvx --from ssh-mcp-win ssh-mcp
 ```
 
 ### GitHub Copilot CLI
@@ -100,7 +170,7 @@ Add to `~/.copilot/mcp-config.json`:
     "ssh-mcp": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
+      "args": ["--from", "ssh-mcp-win", "ssh-mcp"],
       "tools": ["*"]
     }
   }
@@ -119,7 +189,7 @@ Create `.vscode/mcp.json` in your project, using VS Code's top-level `servers` k
     "ssh-mcp": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
+      "args": ["--from", "ssh-mcp-win", "ssh-mcp"]
     }
   }
 }
@@ -132,7 +202,7 @@ Review the configuration before trusting the workspace. Run **MCP: List Servers*
 Use a client that supports local stdio servers:
 
 - Command: `uvx`
-- Arguments: `--from`, `slepp-ssh-mcp`, `ssh-mcp` as three separate arguments
+- Arguments: `--from`, `ssh-mcp-win`, `ssh-mcp` as three separate arguments
 
 For a persistent installation, use the absolute path to the `ssh-mcp` executable with no arguments. The client starts and stops the server process.
 
@@ -391,7 +461,8 @@ The tmux observer is tied to the session lifecycle: stopping a session closes it
 | `SSH_MCP_SCP_BIN` | `scp` | Path to the SCP client |
 | `SSH_MCP_RSYNC_BIN` | `rsync` | Path to rsync |
 | `SSH_MCP_TMUX_BIN` | `tmux` | Path to tmux |
-| `SSH_MCP_STATE_DIR` | `~/.local/state/ssh-mcp` | Where transcripts are stored |
+| `SSH_MCP_STATE_DIR` | `~/.local/state/ssh-mcp` (POSIX), `%LOCALAPPDATA%\ssh-mcp` (Windows) | Where transcripts are stored |
+| `SSH_MCP_PTY_BACKEND` | `auto` | Windows only: `auto`, `conpty`, or `pipe`. Ignored on POSIX |
 
 ## Security
 
@@ -412,6 +483,7 @@ ssh-mcp is designed for single-developer use on your own machine. It runs SSH co
 
 - **POSIX-only remotes** — `cwd`, `env`, and `shell` wrapping assumes a POSIX shell on the remote side. Windows SSH targets need commands written for their shell.
 - **PTY output** — interactive sessions use a PTY, so output includes terminal formatting (ANSI escape codes, command echo, line wrapping). This is intentional — it matches what a human would see.
+- **Windows without `pywinpty`** — the pipe fallback forwards no terminal size, so a remote `stty size` reports `0 0` and full-screen programs lay out badly. Install `pywinpty` (the default on Windows) if you need TUIs.
 - **No multiplexing** — each `ssh_exec` call opens a new SSH connection. If your agent runs many rapid commands to the same host, consider using a session instead, or configure `ControlMaster` in your `~/.ssh/config`.
 - **Transcript growth** — transcripts grow without bound for long-running sessions. The response includes `transcript_size_bytes` so you can monitor this. Restart the session if it gets too large.
 - **Forward connections are standalone** — each `ssh_forward` opens its own SSH connection. Forwards are not tied to sessions.
@@ -466,6 +538,18 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall src
 python3 -m build
 ```
+
+`tests/test_platform_support.py` runs on every platform and exercises whichever
+terminal backend is active. On Windows it is also worth running twice, once per
+backend:
+
+```powershell
+$env:SSH_MCP_PTY_BACKEND = "conpty"; python -m unittest tests.test_platform_support
+$env:SSH_MCP_PTY_BACKEND = "pipe";   python -m unittest tests.test_platform_support
+```
+
+The rest of the suite drives fake `ssh`/`scp`/`rsync` shell scripts, so it needs a
+POSIX host.
 
 ## License
 
