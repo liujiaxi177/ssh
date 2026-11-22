@@ -3,14 +3,24 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slepp-ssh-mcp"
-version = "0.2.0"
-description = "A stdio MCP server that exposes Bash-like SSH execution, sessions, and remote file read/edit/search."
+# Fork of slepp/ssh-mcp with Windows 11 support.  The distribution name has to
+# differ from upstream's (slepp-ssh-mcp) because PyPI names are global; the
+# import package and the `ssh-mcp` command stay the same so existing MCP client
+# configurations keep working.
+name = "ssh-mcp-win"
+dynamic = ["version"]
+description = "A stdio MCP server that exposes Bash-like SSH execution, sessions, and remote file read/edit/search. Windows 11 fork with ConPTY support."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = []
-keywords = ["mcp", "ssh", "scp", "rsync", "tmux"]
+dependencies = [
+    # Windows has no PTY in the standard library.  pywinpty drives ConPTY and
+    # gives interactive sessions a real local terminal (window size, password
+    # prompts).  Without it the server falls back to plain pipes, which still
+    # allocates a *remote* PTY via `ssh -tt` but forwards no window size.
+    "pywinpty>=2.0.0; sys_platform == 'win32'",
+]
+keywords = ["mcp", "ssh", "scp", "rsync", "tmux", "conpty", "windows"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -18,6 +28,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Operating System :: POSIX",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
     "Topic :: System :: Networking",
     "Topic :: System :: Shells",
     "Intended Audience :: Developers",
@@ -27,15 +38,24 @@ classifiers = [
 test = ["jsonschema>=4.18,<5", "openai>=1.66,<2", "httpx>=0.27,<1"]
 
 [project.urls]
-Homepage = "https://github.com/slepp/ssh-mcp"
-Repository = "https://github.com/slepp/ssh-mcp"
-Issues = "https://github.com/slepp/ssh-mcp/issues"
+Homepage = "https://github.com/liujiaxi177/ssh"
+Repository = "https://github.com/liujiaxi177/ssh"
+Issues = "https://github.com/liujiaxi177/ssh/issues"
+Upstream = "https://github.com/slepp/ssh-mcp"
 
 [project.scripts]
+# `ssh-mcp` is the name every MCP client config in the README uses, so the fork
+# keeps it.  `ssh-mcp-win` is an alias that makes `uvx ssh-mcp-win` work without
+# `--from`, because uv matches the command to the distribution name.
 ssh-mcp = "ssh_mcp.__main__:main"
+ssh-mcp-win = "ssh_mcp.__main__:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+
+# Single source of truth for the version: src/ssh_mcp/__init__.py
+[tool.setuptools.dynamic]
+version = { attr = "ssh_mcp.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

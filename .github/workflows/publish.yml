@@ -1,3 +1,16 @@
+# Publishes the `ssh-mcp-win` distribution to PyPI via Trusted Publishing (OIDC),
+# so no API token lives in this repository.
+#
+# One-time setup before the first release:
+#   1. PyPI -> Your projects -> Publishing -> "Add a pending publisher"
+#      Project name: ssh-mcp-win
+#      Owner:        liujiaxi177
+#      Repository:   ssh
+#      Workflow:     publish.yml
+#      Environment:  (leave empty)
+#   2. Publish a GitHub release with tag v<version>, matching
+#      src/ssh_mcp/__init__.py.  A version cannot be re-uploaded to PyPI, so bump
+#      it before tagging.
 name: Publish package
 
 on:
